@@ -1,193 +1,92 @@
-# pytorch-power-backend
-Cross-Repository CI Relay (CRCR) — Onboarding Guide
-This repository serves as the reference implementation and test bed for the Cross-Repository CI Relay (CRCR) system. It demonstrates how an out-of-tree (OOT) backend can receive upstream PyTorch events and run its own CI in response.
+# TorchPowerCI/pytorch-power-backend
 
-Use this guide to onboard your downstream repository into the CRCR pipeline.
+A standalone test repository for validating the [Cross-Repository CI Relay (CRCR)](https://github.com/pytorch/pytorch/issues/175022) pipeline **outside the PyTorch GitHub org**. This simulates a real-world downstream backend (e.g., Red Hat's PyTorch CI) integrating with PyTorch's CI infrastructure.
 
-How It Works
-When a PR is opened or code is pushed to pytorch/pytorch, the pytorch-fdn-cross-repo-ci-relay GitHub App dispatches repository_dispatch events to all approved downstream repositories. Your repository receives these events and can trigger builds, tests, or any workflow in response.
+## Purpose
 
-pytorch/pytorch (PR / push)
-        │
-        ▼
-  CRCR Relay Bot
-  (pytorch-fdn-cross-repo-ci-relay)
-        │
-        ▼
-  repository_dispatch
-        │
-        ├──► your-org/your-repo  (your workflow runs)
-        ├──► Ascend/pytorch
-        ├──► riseproject-dev/pytorch-ci
-        └──► pytorch/crcr-test
-Trust Levels
-Each downstream repository is assigned a trust level that determines how deeply it integrates with PyTorch CI:
+The CRCR system dispatches `repository_dispatch` events from `pytorch/pytorch` to downstream repos whenever a pull request is opened or synchronized. Downstream repos run their CI, then report results back via the [callback action](https://github.com/pytorch/test-infra/tree/main/.github/actions/cross-repo-ci-relay-callback), which ultimately surface on the [PyTorch HUD](https://hud.pytorch.org).
 
-Level	Name	Description
-L1	Onboarding	Events are forwarded to downstream, but upstream receives no feedback.
-L2	Observation	Downstream CI results are displayed on the HUD page, but not on PRs.
-L3	Stable	Adds a non-blocking check run on PRs when ciflow/oot/<name> label is applied.
-L4	Mature	Adds a blocking check run on every PR; reserved for critical accelerators.
-All new repositories start at L1. Promotion to higher levels is based on demonstrated stability and reliability.
+This repo exists to:
 
-Onboarding Steps
-Step 1: Install the CRCR GitHub App
-Install the pytorch-fdn-cross-repo-ci-relay GitHub App on your downstream repository.
+- **Test cross-org dispatch**: Verify that the CRCR relay successfully delivers `repository_dispatch` events to repos outside `pytorch/` and `pytorch-labs/`.
+- **Test OIDC callback authentication**: Confirm that OIDC tokens issued by GitHub Actions in a non-PyTorch org are correctly validated by the callback Lambda.
+- **Test HUD ingestion end-to-end**: Ensure that CI results from an external org flow through DynamoDB → ClickHouse → HUD frontend.
+- **Validate allowlist levels**: Test L2/L3/L4 level assignment for repos not in the PyTorch ecosystem.
+- **Catch org-boundary edge cases**: Surface issues with permissions, OIDC audience claims, or rate limiting that only appear for external contributors.
 
-For installation approval, contact @albanD or @atalman.
+## How It Works
 
-Step 2: Add Your Repository to the Allowlist
-Open a PR against pytorch/pytorch to add your repository to the allowlist file:
+```
+pytorch/pytorch (PR event)
+  │
+  ▼  repository_dispatch
+TorchPowerCI/pytorch-power-backend (this repo)
+  │
+  ├─ Receives dispatch payload (PR number, SHA, action)
+  ├─ Runs simulated CI (build + test)
+  ├─ Sends in_progress callback (OIDC-authenticated)
+  ├─ Sends completed callback with conclusion + test results
+  │
+  ▼
+CRCR Callback Lambda → HUD API → DynamoDB → ClickHouse → HUD UI
+```
 
-File: .github/allowlist.yml
+## Prerequisites
 
-Add your repository under the appropriate level (new repos start at L1):
+1. This repo must be added to the CRCR allowlist (hosted in `pytorch/pytorch`) at the desired level (L2/L3/L4):
+   ```yaml
+   L2:
+     - TorchPowerCI/pytorch-power-backend
+   ```
 
-L1:
-  - pytorch/crcr-test
-  - Ascend/pytorch
-  - riseproject-dev/pytorch-ci
-  - your-org/your-repo          # ← add your repo here
-Step 3: Create a Dispatch Receiver Workflow
-Create a GitHub Actions workflow in your repository that listens for repository_dispatch events. The relay sends two event types:
+2. The CRCR relay Lambda must be configured to dispatch to this repo.
 
-push — Triggered when code is pushed to main or ciflow tags are created (e.g., refs/tags/ciflow/trunk/<pr_number>)
-pull_request — Triggered when a PR is opened, reopened, synchronized, or closed
-Create .github/workflows/out-of-tree-ci.yml in your repository:
+3. GitHub Actions must be enabled with `id-token: write` permission for OIDC callbacks.
 
-name: PyTorch Out-of-Tree Dispatch
+## Workflow Structure
 
-on:
-  repository_dispatch:
-    types:
-      - pull_request
-      - push
+The repo should contain a `.github/workflows/` directory with workflows triggered by `repository_dispatch` events of type `pull_request`. A typical workflow:
 
-run-name: >-
-  Dispatch -
-  ${{
-    github.event.client_payload.event_type == 'pull_request' &&
-    format(
-      'PR #{0} ({1})',
-      github.event.client_payload.payload.pull_request.number,
-      github.event.client_payload.payload.action
-    ) ||
-    github.event.client_payload.payload.ref
-  }}
+1. **Receives** the dispatch event with the PyTorch PR payload
+2. **Reports** `in_progress` status via the callback action
+3. **Checks out** PyTorch at the dispatched SHA
+4. **Runs** build and test steps (can be real or simulated)
+5. **Reports** `completed` status with `conclusion` (`success`/`failure`) and optional `test-results`
 
-concurrency:
-  group: >-
-    oot-${{ github.event.client_payload.payload.repository.full_name }}-${{
-    github.event.client_payload.payload.pull_request.number || github.run_id }}
-  cancel-in-progress: true
+See [`pytorch/crcr-test`](https://github.com/pytorch/crcr-test) for reference workflow implementations.
 
-permissions:
-  actions: write
-  id-token: write   # required for L2+ callback authentication (OIDC)
+## Callback Action Usage
 
-jobs:
-  cancel-workflow:
-    if: ${{ github.event.client_payload.payload.action == 'closed' }}
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "PR closed, canceling older runs in the same concurrency group"
-  build-and-test:
-    if: ${{ github.event.client_payload.payload.action != 'closed' }}  # listen to the specific action types you need (opened, reopened, synchronize)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout your repository
-        uses: actions/checkout@v4
+```yaml
+- name: Report CI started
+  uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+  with:
+    status: in_progress
 
-      - name: Checkout PyTorch at dispatched SHA
-        uses: actions/checkout@v4
-        with:
-          repository: pytorch/pytorch
-          ref: ${{ github.event.client_payload.payload.pull_request.head.sha || github.event.client_payload.payload.after }}
-          path: pytorch
+- name: Report CI completed
+  if: always()
+  uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+  with:
+    status: completed
+    conclusion: ${{ steps.tests.outcome || 'failure' }}
+    test-results: '{"passed": 100, "failed": 2, "skipped": 5, "total": 107}'
+    artifact-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+```
 
-      # Add your build and test steps here
-      - name: Build and test
-        run: |
-          echo "Building against PyTorch SHA: ${{ github.event.client_payload.payload.pull_request.head.sha || github.event.client_payload.payload.after }}"
-          # your build commands here
+## What This Validates That `pytorch/crcr-test` Cannot
 
-      - name: Log event to step summary
-        if: always()
-        run: |
-          cat <<'SUMMARY' >> $GITHUB_STEP_SUMMARY
-          ```json
-          ${{ toJson(github.event) }}
-          ```
-          SUMMARY
-Step 4: Verify the Integration
-Once Steps 1–3 are complete, your workflow will start receiving dispatches. You can verify this by:
+| Scenario | crcr-test (in-org) | This repo (external org) |
+|---|---|---|
+| OIDC token from non-PyTorch org | N/A | Tested |
+| Cross-org `repository_dispatch` delivery | Same org | Different org |
+| Allowlist entry for external org | `pytorch/*` | `TorchedHat/*` |
+| GitHub App installation scope | Already installed | May need separate install |
+| Rate limiting for external callers | Shared limits | Isolated limits |
 
-Checking the Actions tab of your repository for repository_dispatch events
-Looking for runs triggered by pytorch-fdn-cross-repo-ci-relay[bot]
-Inspecting the step summary for the full event payload
-Dispatch Payload Structure
-The relay wraps the original GitHub event inside client_payload:
+## Related Resources
 
-{
-  "event_type": "push",
-  "client_payload": {
-    "event_type": "push",
-    "payload": {
-      "ref": "refs/tags/ciflow/trunk/184534",
-      "after": "abc123...",
-      "deleted": false,
-      "base_ref": "refs/heads/main",
-      "repository": {
-        "full_name": "pytorch/pytorch"
-      }
-    }
-  }
-}
-For pull_request events:
-
-{
-  "event_type": "pull_request",
-  "client_payload": {
-    "event_type": "pull_request",
-    "payload": {
-      "action": "opened",
-      "pull_request": {
-        "number": 184442,
-        "title": "My PR title",
-        "head": {
-          "sha": "abc123...",
-          "repo": {
-            "full_name": "user/pytorch"
-          }
-        }
-      },
-      "repository": {
-        "full_name": "pytorch/pytorch"
-      }
-    }
-  }
-}
-Key Fields Reference
-Field	Path	Description
-Event type	github.event.client_payload.event_type	push or pull_request
-Upstream repo	github.event.client_payload.payload.repository.full_name	Always pytorch/pytorch
-Push ref	github.event.client_payload.payload.ref	Git ref (e.g., refs/tags/ciflow/trunk/12345)
-Push SHA	github.event.client_payload.payload.after	Commit SHA for push events
-PR number	github.event.client_payload.payload.pull_request.number	PR number for pull_request events
-PR action	github.event.client_payload.payload.action	opened, reopened, synchronize, closed
-PR head SHA	github.event.client_payload.payload.pull_request.head.sha	Head commit SHA of the PR
-PR head repo	github.event.client_payload.payload.pull_request.head.repo.full_name	Fork repo (if applicable)
-Related Resources
-RFC-0050: Cross-Repository CI Relay — Full CRCR design specification
-Allowlist — Current list of approved downstream repositories
-CRCR Relay GitHub App — The relay bot
-Tracking Issue — CRCR tracking issue
-Contacts
-For questions about onboarding, installation approval, or promotion to higher trust levels:
-
-@albanD — PyTorch Core Maintainer
-@atalman — PyTorch Dev Infra
-@groenenboomj
-@jewelkm89
-@subinz1
-@fffrog
+- [RFC: OOT HUD Integration](https://github.com/pytorch/pytorch/issues/175022)
+- [CRCR Relay Lambda](https://github.com/pytorch/test-infra/tree/main/aws/lambda/cross_repo_ci_relay)
+- [Callback Action](https://github.com/pytorch/test-infra/tree/main/.github/actions/cross-repo-ci-relay-callback)
+- [crcr-test (in-org test repo)](https://github.com/pytorch/crcr-test)
+- [OOT HUD Mockups](https://subinz1.github.io/rfcs/RFC-0054-assets/oot-hud-mockup.html)

@@ -1,0 +1,142 @@
+name: PyTorch POWER L1 Dispatch
+
+on:
+  repository_dispatch:
+    types:
+      - pull_request
+      - push
+
+run-name: >-
+  POWER L1 -
+  ${{
+    github.event.client_payload.event_type == 'pull_request' &&
+    format(
+      'PR #{0} ({1})',
+      github.event.client_payload.payload.pull_request.number,
+      github.event.client_payload.payload.action
+    ) ||
+    github.event.client_payload.payload.ref
+  }}
+
+concurrency:
+  group: >-
+    power-l1-${{ github.event.client_payload.payload.repository.full_name }}-${{
+    github.event.client_payload.payload.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cancel-workflow:
+    if: ${{ github.event.client_payload.payload.action == 'closed' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: PR closed
+        run: echo "PR closed, allowing concurrency cancellation to stop older runs"
+
+  power-build-and-test:
+    if: ${{ github.event.client_payload.payload.action != 'closed' }}
+    runs-on:
+      - self-hosted
+      - linux
+      - ppc64le
+      - power10
+      - torch-power-ci
+
+    env:
+      PYTORCH_REPO_URL: https://github.com/pytorch/pytorch.git
+      POWER_HOST: torch-power-ci.pperf.tadn.ibm.com
+
+    steps:
+      - name: Checkout POWER backend repository
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream SHA
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="${{ github.event.client_payload.payload.pull_request.head.sha || github.event.client_payload.payload.after }}"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout upstream PyTorch
+        uses: actions/checkout@v4
+        with:
+          repository: pytorch/pytorch
+          ref: ${{ steps.upstream.outputs.sha }}
+          path: pytorch
+
+      - name: Log dispatch summary
+        shell: bash
+        run: |
+          cat <<SUMMARY >> "$GITHUB_STEP_SUMMARY"
+          ## POWER L1 dispatch received
+
+          - Event type: `${{ github.event.client_payload.event_type }}`
+          - Action: `${{ github.event.client_payload.payload.action || 'n/a' }}`
+          - Upstream repo: `${{ github.event.client_payload.payload.repository.full_name }}`
+          - Upstream SHA: `${{ steps.upstream.outputs.sha }}`
+          - Runner host: `${{ env.POWER_HOST }}`
+
+          ### Raw event
+          ```json
+          ${{ toJson(github.event) }}
+          ```
+          SUMMARY
+
+      - name: Prepare Python environment
+        shell: bash
+        working-directory: ./pytorch
+        run: |
+          set -euxo pipefail
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install PyTorch build dependencies
+        shell: bash
+        working-directory: ./pytorch
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          fi
+
+      - name: Build PyTorch wheel on POWER10
+        shell: bash
+        working-directory: ./pytorch
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
+          export USE_CUDA=0
+          export BUILD_TEST=0
+          export USE_DISTRIBUTED=1
+          export MAX_JOBS="$(python - <<'PY2'
+          import os
+          print(max(1, os.cpu_count() or 1))
+          PY2
+          )"
+          python setup.py bdist_wheel
+
+      - name: Run POWER smoke test
+        shell: bash
+        working-directory: ./pytorch
+        run: |
+          set -euxo pipefail
+          . .venv/bin/activate
+          python - <<'PY3'
+          import torch
+          print(torch.__version__)
+          print(torch.rand(2, 3))
+          PY3
+
+      - name: Upload wheel artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: power-l1-wheel-${{ github.run_id }}
+          path: pytorch/dist/*
+          if-no-files-found: warn
