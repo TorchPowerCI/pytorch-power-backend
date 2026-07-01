@@ -54,16 +54,13 @@ jobs:
 
   power-build-and-test:
     if: ${{ github.event.client_payload.payload.action != 'closed' }}
-    runs-on:
-      - self-hosted
-      - linux
-      - ppc64le
-      - power10
-      - torch-power-ci
+    runs-on: ubuntu-latest
 
     env:
       PYTORCH_REPO_URL: https://github.com/pytorch/pytorch.git
       POWER_HOST: ailiblpar1.pperf.tadn.ibm.com
+      POWER_USER: ${{ secrets.POWER_SSH_USER }}
+      REMOTE_WORK_DIR: /tmp/pytorch-ci-${{ github.run_id }}
 
     steps:
       - name: Checkout POWER backend repository
@@ -83,6 +80,7 @@ jobs:
           repository: pytorch/pytorch
           ref: ${{ steps.upstream.outputs.sha }}
           path: pytorch
+          submodules: recursive
 
       - name: Log dispatch summary
         shell: bash
@@ -95,6 +93,7 @@ jobs:
           - Upstream repo: `${{ github.event.client_payload.payload.repository.full_name }}`
           - Upstream SHA: `${{ steps.upstream.outputs.sha }}`
           - Runner host: `${{ env.POWER_HOST }}`
+          - Remote work directory: `${{ env.REMOTE_WORK_DIR }}`
 
           ### Raw event
           ```json
@@ -102,57 +101,140 @@ jobs:
           ```
           SUMMARY
 
-      - name: Prepare Python environment
+      - name: Archive PyTorch source
         shell: bash
-        working-directory: ./pytorch
         run: |
           set -euxo pipefail
+          cd pytorch
+          tar -czf ../pytorch-source.tar.gz \
+            --exclude='.git' \
+            --exclude='*.pyc' \
+            --exclude='__pycache__' \
+            --exclude='.venv' \
+            --exclude='venv' \
+            --exclude='build' \
+            --exclude='dist' \
+            .
+          cd ..
+          ls -lh pytorch-source.tar.gz
+
+      - name: Setup SSH key
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "${{ secrets.POWER_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ env.POWER_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Copy source to Power LPAR
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "Transferring source archive to ${{ env.POWER_HOST }}..."
+          scp -o StrictHostKeyChecking=no \
+            pytorch-source.tar.gz \
+            ${{ env.POWER_USER }}@${{ env.POWER_HOST }}:${{ env.REMOTE_WORK_DIR }}-source.tar.gz
+          echo "Transfer complete"
+
+      - name: Extract source on Power LPAR
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ssh ${{ env.POWER_USER }}@${{ env.POWER_HOST }} << 'ENDSSH'
+          set -euxo pipefail
+          mkdir -p ${{ env.REMOTE_WORK_DIR }}
+          cd ${{ env.REMOTE_WORK_DIR }}
+          tar -xzf ${{ env.REMOTE_WORK_DIR }}-source.tar.gz
+          rm ${{ env.REMOTE_WORK_DIR }}-source.tar.gz
+          ls -la
+          ENDSSH
+
+      - name: Create Python virtual environment on Power LPAR
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ssh ${{ env.POWER_USER }}@${{ env.POWER_HOST }} << 'ENDSSH'
+          set -euxo pipefail
+          cd ${{ env.REMOTE_WORK_DIR }}
           python3 -m venv .venv
           . .venv/bin/activate
           python -m pip install --upgrade pip setuptools wheel
-
-      - name: Install PyTorch build dependencies
-        shell: bash
-        working-directory: ./pytorch
-        run: |
-          set -euxo pipefail
-          . .venv/bin/activate
           if [ -f requirements.txt ]; then
             python -m pip install -r requirements.txt
           fi
+          ENDSSH
 
-      - name: Build PyTorch wheel on POWER10
+      - name: Build PyTorch on Power LPAR
         shell: bash
-        working-directory: ./pytorch
         run: |
           set -euxo pipefail
+          ssh ${{ env.POWER_USER }}@${{ env.POWER_HOST }} << 'ENDSSH'
+          set -euxo pipefail
+          cd ${{ env.REMOTE_WORK_DIR }}
           . .venv/bin/activate
+          
           export USE_CUDA=0
           export BUILD_TEST=0
           export USE_DISTRIBUTED=1
-          export MAX_JOBS="$(python - <<'PY2'
+          export MAX_JOBS="$(python - <<'PY'
           import os
           print(max(1, os.cpu_count() or 1))
-          PY2
+          PY
           )"
+          
+          echo "Building PyTorch with MAX_JOBS=${MAX_JOBS}..."
           python setup.py bdist_wheel
+          
+          echo "Build complete. Wheel files:"
+          ls -lh dist/
+          ENDSSH
 
-      - name: Run POWER smoke test
+      - name: Run tests on Power LPAR
         shell: bash
-        working-directory: ./pytorch
         run: |
           set -euxo pipefail
+          ssh ${{ env.POWER_USER }}@${{ env.POWER_HOST }} << 'ENDSSH'
+          set -euxo pipefail
+          cd ${{ env.REMOTE_WORK_DIR }}
           . .venv/bin/activate
-          python - <<'PY3'
+          
+          echo "Running smoke tests..."
+          python - <<'PY'
           import torch
-          print(torch.__version__)
-          print(torch.rand(2, 3))
-          PY3
+          print(f"PyTorch version: {torch.__version__}")
+          print(f"Test tensor: {torch.rand(2, 3)}")
+          print("Smoke test passed!")
+          PY
+          ENDSSH
+
+      - name: Copy artifacts back from Power LPAR
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p ./artifacts
+          echo "Copying wheel artifacts from ${{ env.POWER_HOST }}..."
+          scp -o StrictHostKeyChecking=no \
+            "${{ env.POWER_USER }}@${{ env.POWER_HOST }}:${{ env.REMOTE_WORK_DIR }}/dist/*.whl" \
+            ./artifacts/ || echo "No wheel files found or copy failed"
+          ls -lh ./artifacts/
+
+      - name: Cleanup remote workspace
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ssh ${{ env.POWER_USER }}@${{ env.POWER_HOST }} << 'ENDSSH'
+          set -euxo pipefail
+          echo "Cleaning up ${{ env.REMOTE_WORK_DIR }}..."
+          rm -rf ${{ env.REMOTE_WORK_DIR }}
+          echo "Cleanup complete"
+          ENDSSH
 
       - name: Upload wheel artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: power-l1-wheel-${{ github.run_id }}
-          path: pytorch/dist/*
+          path: artifacts/*.whl
           if-no-files-found: warn

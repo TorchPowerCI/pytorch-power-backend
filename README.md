@@ -1,92 +1,131 @@
-# TorchPowerCI/pytorch-power-backend
+# PyTorch POWER Backend CI/CD
 
-A standalone test repository for validating the [Cross-Repository CI Relay (CRCR)](https://github.com/pytorch/pytorch/issues/175022) pipeline **outside the PyTorch GitHub org**. This simulates a real-world downstream backend (e.g., Red Hat's PyTorch CI) integrating with PyTorch's CI infrastructure.
+This repository contains the GitHub Actions workflow for building and testing PyTorch on IBM POWER architecture (ppc64le).
 
-## Purpose
+## Architecture Overview
 
-The CRCR system dispatches `repository_dispatch` events from `pytorch/pytorch` to downstream repos whenever a pull request is opened or synchronized. Downstream repos run their CI, then report results back via the [callback action](https://github.com/pytorch/test-infra/tree/main/.github/actions/cross-repo-ci-relay-callback), which ultimately surface on the [PyTorch HUD](https://hud.pytorch.org).
-
-This repo exists to:
-
-- **Test cross-org dispatch**: Verify that the CRCR relay successfully delivers `repository_dispatch` events to repos outside `pytorch/` and `pytorch-labs/`.
-- **Test OIDC callback authentication**: Confirm that OIDC tokens issued by GitHub Actions in a non-PyTorch org are correctly validated by the callback Lambda.
-- **Test HUD ingestion end-to-end**: Ensure that CI results from an external org flow through DynamoDB → ClickHouse → HUD frontend.
-- **Validate allowlist levels**: Test L2/L3/L4 level assignment for repos not in the PyTorch ecosystem.
-- **Catch org-boundary edge cases**: Surface issues with permissions, OIDC audience claims, or rate limiting that only appear for external contributors.
-
-## How It Works
+The CI/CD pipeline uses a hybrid approach to work around GitHub Actions' lack of native ppc64le runner support:
 
 ```
-pytorch/pytorch (PR event)
-  │
-  ▼  repository_dispatch
-TorchPowerCI/pytorch-power-backend (this repo)
-  │
-  ├─ Receives dispatch payload (PR number, SHA, action)
-  ├─ Runs simulated CI (build + test)
-  ├─ Sends in_progress callback (OIDC-authenticated)
-  ├─ Sends completed callback with conclusion + test results
-  │
-  ▼
-CRCR Callback Lambda → HUD API → DynamoDB → ClickHouse → HUD UI
+GitHub Event
+      │
+      ▼
+GitHub-hosted ubuntu-latest
+      │
+      ├── Checkout PyTorch
+      ├── Archive source
+      ├── Copy source to Power LPAR (scp/rsync)
+      ├── ssh ailiblpar1
+      │      ├── Extract source
+      │      ├── Create venv
+      │      ├── Build PyTorch
+      │      └── Run tests
+      └── Copy artifacts back
 ```
 
-## Prerequisites
+## Workflow Details
 
-1. This repo must be added to the CRCR allowlist (hosted in `pytorch/pytorch`) at the desired level (L2/L3/L4):
-   ```yaml
-   L2:
-     - TorchPowerCI/pytorch-power-backend
-   ```
+The workflow (`power-crcr-ci.yml`) performs the following steps:
 
-2. The CRCR relay Lambda must be configured to dispatch to this repo.
+1. **GitHub-hosted Runner (ubuntu-latest)**:
+   - Checks out the PyTorch source code
+   - Archives the source into a tarball
+   - Transfers the archive to the Power LPAR via SCP
 
-3. GitHub Actions must be enabled with `id-token: write` permission for OIDC callbacks.
+2. **Power LPAR (via SSH)**:
+   - Extracts the source code
+   - Creates a Python virtual environment
+   - Installs dependencies
+   - Builds PyTorch wheel
+   - Runs smoke tests
 
-## Workflow Structure
+3. **GitHub-hosted Runner (ubuntu-latest)**:
+   - Copies build artifacts back from Power LPAR
+   - Uploads artifacts to GitHub Actions
+   - Cleans up remote workspace
 
-The repo should contain a `.github/workflows/` directory with workflows triggered by `repository_dispatch` events of type `pull_request`. A typical workflow:
+## Required GitHub Secrets
 
-1. **Receives** the dispatch event with the PyTorch PR payload
-2. **Reports** `in_progress` status via the callback action
-3. **Checks out** PyTorch at the dispatched SHA
-4. **Runs** build and test steps (can be real or simulated)
-5. **Reports** `completed` status with `conclusion` (`success`/`failure`) and optional `test-results`
+To use this workflow, you must configure the following secrets in your GitHub repository:
 
-See [`pytorch/crcr-test`](https://github.com/pytorch/crcr-test) for reference workflow implementations.
+### `POWER_SSH_USER`
+- **Description**: SSH username for connecting to the Power LPAR
+- **Example**: `pytorch-ci`
+- **Setup**: Go to Settings → Secrets and variables → Actions → New repository secret
 
-## Callback Action Usage
+### `POWER_SSH_PRIVATE_KEY`
+- **Description**: SSH private key for authentication to the Power LPAR
+- **Format**: Full private key including headers
+- **Example**:
+  ```
+  -----BEGIN OPENSSH PRIVATE KEY-----
+  b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABlwAAAAdzc2gtcn
+  ...
+  -----END OPENSSH PRIVATE KEY-----
+  ```
+- **Setup**: 
+  1. Generate an SSH key pair on your local machine: `ssh-keygen -t rsa -b 4096 -C "pytorch-ci"`
+  2. Copy the public key to the Power LPAR: `ssh-copy-id user@ailiblpar1.pperf.tadn.ibm.com`
+  3. Copy the entire private key content and add it as a GitHub secret
 
-```yaml
-- name: Report CI started
-  uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
-  with:
-    status: in_progress
+## Environment Variables
 
-- name: Report CI completed
-  if: always()
-  uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
-  with:
-    status: completed
-    conclusion: ${{ steps.tests.outcome || 'failure' }}
-    test-results: '{"passed": 100, "failed": 2, "skipped": 5, "total": 107}'
-    artifact-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-```
+The workflow uses the following environment variables:
 
-## What This Validates That `pytorch/crcr-test` Cannot
+- `POWER_HOST`: Hostname of the Power LPAR (default: `ailiblpar1.pperf.tadn.ibm.com`)
+- `REMOTE_WORK_DIR`: Temporary directory on the Power LPAR for build operations
+- `PYTORCH_REPO_URL`: URL of the PyTorch repository
 
-| Scenario | crcr-test (in-org) | This repo (external org) |
-|---|---|---|
-| OIDC token from non-PyTorch org | N/A | Tested |
-| Cross-org `repository_dispatch` delivery | Same org | Different org |
-| Allowlist entry for external org | `pytorch/*` | `TorchedHat/*` |
-| GitHub App installation scope | Already installed | May need separate install |
-| Rate limiting for external callers | Shared limits | Isolated limits |
+## Prerequisites on Power LPAR
 
-## Related Resources
+The Power LPAR must have the following installed:
 
-- [RFC: OOT HUD Integration](https://github.com/pytorch/pytorch/issues/175022)
-- [CRCR Relay Lambda](https://github.com/pytorch/test-infra/tree/main/aws/lambda/cross_repo_ci_relay)
-- [Callback Action](https://github.com/pytorch/test-infra/tree/main/.github/actions/cross-repo-ci-relay-callback)
-- [crcr-test (in-org test repo)](https://github.com/pytorch/crcr-test)
-- [OOT HUD Mockups](https://subinz1.github.io/rfcs/RFC-0054-assets/oot-hud-mockup.html)
+- Python 3.8 or later
+- `python3-venv` package
+- Build tools (gcc, g++, make)
+- Git (for submodules)
+- Sufficient disk space for PyTorch builds (~10GB recommended)
+
+## Triggering the Workflow
+
+The workflow is triggered by:
+
+- **Pull Requests**: Opened, synchronized, or reopened on `main`, `master`, or `release/**` branches
+- **Push Events**: Commits pushed to `main`, `master`, or `release/**` branches
+- **Repository Dispatch**: External webhook events with types `pull_request` or `push`
+
+## Artifacts
+
+Build artifacts (PyTorch wheel files) are uploaded to GitHub Actions and can be downloaded from the workflow run page.
+
+## Troubleshooting
+
+### SSH Connection Issues
+- Verify the `POWER_SSH_USER` and `POWER_SSH_PRIVATE_KEY` secrets are correctly configured
+- Ensure the Power LPAR is accessible from GitHub's IP ranges
+- Check that the SSH key has been added to `~/.ssh/authorized_keys` on the Power LPAR
+
+### Build Failures
+- Check the Power LPAR has sufficient resources (CPU, memory, disk space)
+- Verify all build dependencies are installed
+- Review the build logs in the GitHub Actions workflow run
+
+### Cleanup Issues
+- The workflow automatically cleans up the remote workspace after each run
+- If manual cleanup is needed, SSH to the Power LPAR and remove `/tmp/pytorch-ci-*` directories
+
+## Security Considerations
+
+- SSH private keys are stored as GitHub encrypted secrets
+- The workflow uses `StrictHostKeyChecking=no` for automated connections (consider using known_hosts for production)
+- Remote workspace directories are unique per workflow run to prevent conflicts
+- Cleanup steps run even if the workflow fails to prevent disk space issues
+
+## Contributing
+
+When modifying the workflow:
+
+1. Test changes in a fork first
+2. Ensure all secrets are properly referenced
+3. Verify cleanup steps execute correctly
+4. Update this README if new secrets or prerequisites are added
