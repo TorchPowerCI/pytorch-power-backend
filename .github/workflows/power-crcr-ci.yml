@@ -1,6 +1,22 @@
 name: PyTorch POWER L1 Dispatch
 
 on:
+  pull_request:
+    branches:
+      - main
+      - master
+      - release/**
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+  push:
+    branches:
+      - main
+      - master
+      - release/**
+
   repository_dispatch:
     types:
       - pull_request
@@ -47,7 +63,7 @@ jobs:
 
     env:
       PYTORCH_REPO_URL: https://github.com/pytorch/pytorch.git
-      POWER_HOST: torch-power-ci.pperf.tadn.ibm.com
+      POWER_HOST: ailiblpar1.pperf.tadn.ibm.com
 
     steps:
       - name: Checkout POWER backend repository
