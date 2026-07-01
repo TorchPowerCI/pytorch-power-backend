@@ -1,4 +1,3 @@
-
 # TorchPowerCI/pytorch-power-backend
 
 A standalone test repository for validating the [Cross-Repository CI Relay (CRCR)](https://github.com/pytorch/pytorch/issues/175022) pipeline **outside the PyTorch GitHub org**. This simulates a real-world downstream backend (e.g., Red Hat's PyTorch CI) integrating with PyTorch's CI infrastructure.
